@@ -1,26 +1,26 @@
 import os
-import re  # Wymagane do walidacji wyrażeń regularnych
+import re
 
+import psycopg2
 from flask import Flask, jsonify, request
-from flask_cors import CORS
-
-HASHES_FILE = os.environ.get("HASHES_FILE", "/app/data/leaked-sha1.txt")
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:8080"])
 
+def connect():
+    # Dane połączenia przychodzą ze zmiennych środowiskowych ustawionych w docker-compose.yml
+    return psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+    )
 
-def load_hashes():
-    with open(HASHES_FILE, encoding="utf-8") as f:
-        return {line.strip().lower() for line in f if line.strip()}
-
-
-KNOWN_HASHES = load_hashes()
-print(f"Wczytano {len(KNOWN_HASHES)} hashy z {HASHES_FILE}", flush=True)
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# Sprawdzenie bazy raz, przy starcie - bez niej usługa nie ma sensu
+conn = connect()
+with conn.cursor() as cur:
+    cur.execute("SELECT count(*) FROM leaked_hashes")
+    print(f"W bazie jest {cur.fetchone()[0]} hashy", flush=True)
+conn.close()
 
 @app.post("/check")
 def check():
@@ -29,20 +29,26 @@ def check():
         return jsonify({"error": "brak pola 'hash'"}), 400
 
     h = str(data["hash"]).lower()
-
-    # Krok 3: Sprawdzenie poprawności formatu SHA-1 (40 znaków heksadecymalnych) przed zalogowaniem
     if not re.fullmatch(r"[0-9a-f]{40}", h):
-        return jsonify({"error": "niepoprawny format hasha"}), 400
+        return jsonify({"error": "pole 'hash' musi być skrótem SHA-1 (40 znaków hex)"}), 400
 
-    # Krok 3: W logu zapisujemy tylko początek skrótu (np. 5 pierwszych znaków)
-    print(f"check: hash={h[:5]}", flush=True)
+    # Pełny SHA-1 popularnego hasła łatwo odwrócić - w logu tylko początek
+    print(f"check: hash={h[:5]}...", flush=True)
 
-    # TODO 1: sprawdź, czy h należy do zbioru KNOWN_HASHES
-    found = h in KNOWN_HASHES
-
-    # TODO 2: zwróć JSON {"found": found}
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            # %s = parametr zapytania: wartość h nigdy nie staje się częścią kodu SQL
+            cur.execute("SELECT EXISTS (SELECT 1 FROM leaked_hashes WHERE hash = %s)", (h,))
+            found = cur.fetchone()[0]
+    finally:
+        conn.close()
     return jsonify({"found": found})
-
-
+    
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"})
+    
 if __name__ == "__main__":
+    # 0.0.0.0 = nasłuchuj na wszystkich interfejsach kontenera, nie tylko na jego localhost
     app.run(host="0.0.0.0", port=5000)
